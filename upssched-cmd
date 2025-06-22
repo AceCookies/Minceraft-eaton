@@ -1,0 +1,221 @@
+#!/bin/bash
+
+LOGFILE="/var/log/upssched/debug.log"
+NOW=$(date '+%Y-%m-%d %H:%M:%S')
+EVENT="$1"
+HOST=$(hostname)
+UPTIME=$(uptime -p)
+LOAD=$(uptime | awk -F'load average:' '{ print $2 }' | xargs)
+RAM=$(free -h | awk '/Mem:/ { print $3 " / " $2 }')
+DISK=$(df -h / | awk 'NR==2 { print $3 " / " $2 " (" $5 ")" }')
+UPS="eatonups@localhost"
+UPS_STATUS=$(upsc $UPS ups.status)
+UPS_BATTERY=$(upsc $UPS battery.charge)
+UPS_RUNTIME=$(upsc $UPS battery.runtime | awk '{printf "%d min", $1/60}')
+UPS_INPUT=$(upsc $UPS input.voltage)
+UPS_LOAD=$(upsc $UPS ups.load)
+
+# Log debug
+mkdir -p $(dirname "$LOGFILE")
+echo "$NOW — Appel avec argument : $EVENT" >> "$LOGFILE"
+echo "$NOW — DEBUG: Script exécuté avec argument : $EVENT" >> "$LOGFILE"
+
+# Création du JSON Discord
+make_discord_embed() {
+    local emoji="$1"
+    local title="$2"
+    local desc="$3"
+    local color="$4"
+    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local avatar_url="https://i.imgur.com/image.png"
+    local bot_name="Nom de bot"
+
+    jq -n \
+        --arg username "$bot_name" \
+        --arg avatar_url "$avatar_url" \
+        --arg content "@everyone $emoji **[$EVENT]**" \
+        --arg title "$emoji $title" \
+        --arg desc "$desc" \
+        --arg timestamp "$timestamp" \
+        --arg status "$UPS_STATUS" \
+        --arg battery "$UPS_BATTERY %" \
+        --arg runtime "$UPS_RUNTIME" \
+        --arg input "$UPS_INPUT V" \
+        --arg load "$UPS_LOAD %" \
+        --arg host "\`$HOST\`" \
+        --arg uptime "\`$UPTIME\`" \
+        --arg disk "\`$DISK\`" \
+        --arg cpu "\`$LOAD\`" \
+        --arg ram "\`$RAM\`" \
+        --argjson color "$color" \
+        '{
+            username: $username,
+            avatar_url: $avatar_url,
+            content: $content,
+            embeds: [
+              {
+                title: $title,
+                description: $desc,
+                color: $color,
+                timestamp: $timestamp,
+                footer: { text: "Alerte UPS automatique" },
+                fields: [
+                  { name: "🧠 État UPS", value: $status, inline: true },
+                  { name: "🔋 Batterie", value: $battery, inline: true },
+                  { name: "⏳ Autonomie", value: $runtime, inline: true },
+                  { name: "🔌 Tension Entrée", value: $input, inline: true },
+                  { name: "⚡ Charge UPS", value: $load, inline: true },
+                  { name: "🖥️ Serveur", value: $host, inline: true },
+                  { name: "📊 Uptime", value: $uptime, inline: true },
+                  { name: "📀 Disque /", value: $disk, inline: true },
+                  { name: "📊 CPU", value: $cpu, inline: true },
+                  { name: "🧠 RAM", value: $ram, inline: true }
+                ]
+              }
+            ]
+        }'
+}
+
+send_discord() {
+    local emoji="$1"
+    local title="$2"
+    local desc="$3"
+    local color="$4"
+    make_discord_embed "$emoji" "$title" "$desc" "$color" | /etc/nut/upssched/send_discord_servername.sh
+    make_discord_embed "$emoji" "$title" "$desc" "$color" | /etc/nut/upssched/send_discord_servername2.sh
+}
+
+send_email() {
+    local subject="$1"
+    local html_body="$2"
+
+    {
+        echo "Subject: $subject"
+        echo "From: Utilisateur <noreply@domain.fr>"
+        echo "To: adresse email destinataire"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo
+        cat <<EOF
+
+<!DOCTYPE html>
+<html>
+  <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    <div style="background-color: #ffffff; padding: 20px; border-radius: 8px; max-width: 600px; margin: auto; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
+      $html_body
+
+      <h3 style="margin-top: 30px; color: #555;">🔎 Informations système</h3>
+      <table style="width: 100%; border-collapse: collapse;">
+        <tr><td style="padding: 4px;"><strong>Serveur</strong></td><td style="padding: 4px;">$HOST</td></tr>
+        <tr><td style="padding: 4px;"><strong>Uptime</strong></td><td style="padding: 4px;">$UPTIME</td></tr>
+        <tr><td style="padding: 4px;"><strong>Charge CPU</strong></td><td style="padding: 4px;">$LOAD</td></tr>
+        <tr><td style="padding: 4px;"><strong>RAM</strong></td><td style="padding: 4px;">$RAM</td></tr>
+        <tr><td style="padding: 4px;"><strong>Disque /</strong></td><td style="padding: 4px;">$DISK</td></tr>
+        <tr><td style="padding: 4px;"><strong>État UPS</strong></td><td style="padding: 4px;">$UPS_STATUS</td></tr>
+        <tr><td style="padding: 4px;"><strong>Batterie</strong></td><td style="padding: 4px;">$UPS_BATTERY%</td></tr>
+        <tr><td style="padding: 4px;"><strong>Autonomie</strong></td><td style="padding: 4px;">$UPS_RUNTIME</td></tr>
+        <tr><td style="padding: 4px;"><strong>Entrée secteur</strong></td><td style="padding: 4px;">$UPS_INPUT V</td></tr>
+        <tr><td style="padding: 4px;"><strong>Charge onduleur</strong></td><td style="padding: 4px;">$UPS_LOAD%</td></tr>
+        <tr><td style="padding: 4px;"><strong>Date/Heure</strong></td><td style="padding: 4px;">$NOW</td></tr>
+      </table>
+
+      <p style="font-size: 11px; color: #999; margin-top: 30px; text-align: center;">
+        Notification automatique envoyée par le système UPS du serveur <strong>$HOST</strong>.
+      </p>
+    </div>
+  </body>
+</html>
+EOF
+    } | msmtp -a sendgrid ADRESSE EMAIL
+}
+
+case "$EVENT" in
+    onbatt)
+        logger "⚠️ Coupure de courant détectée — L'onduleur est sur batterie."
+        send_discord "⚠️" "Coupure de courant détectée" "$(cat <<EOF
+L'alimentation secteur est interrompue.
+Le serveur fonctionne actuellement sur batterie.
+
+Si le courant ne revient pas dans 5 minutes, une extinction automatique sera déclenchée.
+EOF
+)" 16776960
+
+        send_email "⚠️ Coupure de courant détectée" "$(cat <<EOF
+<html>
+  <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    <div style="background-color: #ffffff; padding: 20px; border-radius: 6px;">
+      <h2 style="color: #e67e22;">⚠️ Coupure de courant détectée</h2>
+      <p>L'onduleur <strong>eatonups</strong> fonctionne actuellement sur batterie.</p>
+      <p>Le courant secteur est interrompu.</p>
+      <p style="color: #c0392b;"><strong>Si le courant ne revient pas dans les 5 prochaines minutes, le serveur sera éteint automatiquement.</strong></p>
+      <hr style="margin-top: 30px;">
+      <p style="font-size: 12px; color: #999;">Notification générée automatiquement par le système UPS - Serveur <strong>minceraft</strong>.</p>
+    </div>
+  </body>
+</html>
+EOF
+)"
+        ;;
+
+    cancelshutdown|online)
+        logger "✅ Alimentation secteur rétablie — Extinction annulée."
+        send_discord "✅" "Courant rétabli" "$(cat <<EOF
+L'alimentation électrique a été restaurée.
+Le serveur continue de fonctionner normalement.
+
+L’extinction automatique a été annulée.
+EOF
+)" 65280
+
+        send_email "✅ Alimentation rétablie" "$(cat <<EOF
+<html>
+  <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    <div style="background-color: #ffffff; padding: 20px; border-radius: 6px;">
+      <h2 style="color: #27ae60;">✅ Alimentation secteur rétablie</h2>
+      <p>Le courant secteur est revenu. L’onduleur fonctionne à nouveau sur secteur.</p>
+      <p>Le serveur continue de fonctionner normalement.</p>
+      <p style="color: #27ae60;"><strong>L’extinction automatique a été annulée.</strong></p>
+      <hr style="margin-top: 30px;">
+      <p style="font-size: 12px; color: #999;">Notification générée automatiquement par le système UPS - Serveur <strong>minceraft</strong>.</p>
+    </div>
+  </body>
+</html>
+EOF
+)"
+        ;;
+
+    shutdowncritical)
+        logger "⛔ Arrêt critique — Le serveur va être éteint."
+        send_discord "⛔" "Extinction immédiate du serveur" "$(cat <<EOF
+La coupure de courant dure depuis plus de 5 minutes.
+L'autonomie de l'onduleur est insuffisante.
+
+Extinction du serveur en cours pour éviter toute perte de données.
+EOF
+)" 16711680
+
+        send_email "⛔ Extinction du serveur en cours" "$(cat <<EOF
+<html>
+  <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    <div style="background-color: #ffffff; padding: 20px; border-radius: 6px;">
+      <h2 style="color: #c0392b;">⛔ Extinction imminente du serveur</h2>
+      <p>L’onduleur <strong>eatonups</strong> a atteint un niveau critique d’autonomie.</p>
+      <p>Le courant secteur est toujours absent après plus de 5 minutes.</p>
+      <p style="color: #c0392b;"><strong>Le serveur va maintenant s’éteindre pour éviter toute perte de données.</strong></p>
+      <hr style="margin-top: 30px;">
+      <p style="font-size: 12px; color: #999;">Notification générée automatiquement par le système UPS - Serveur <strong>minceraft</strong>.</p>
+    </div>
+  </body>
+</html>
+EOF
+)"
+        /sbin/shutdown -h now
+        ;;
+
+    *)
+        logger "🔍 Événement UPS non reconnu : $EVENT"
+        ;;
+esac
+
+
+
