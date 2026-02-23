@@ -1,0 +1,330 @@
+#!/bin/bash
+set -euo pipefail
+
+# =========================
+# CONFIG
+# =========================
+UPS_NAME="eatonups@localhost"
+
+# Email (NE PAS TOUCHER : on garde le rendu actuel)
+MAIL_TO="EMAIL@DOMAINE.com"
+MAIL_FROM="Minceraft <noreply@trottisteel.fr>"
+MAIL_SUBJECT_PREFIX="UPS"
+
+# Discord (style "tableau" + ping)
+DISCORD_MENTION="@everyone"
+AVATAR_URL="https://URL.COM/storage/img/"
+BOT_NAME="Serveur Minceraft"
+
+# Files
+LOGFILE="/var/log/upssched/debug.log"
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+EVENT="${1:-unknown}"
+HOST="$(hostname)"
+
+mkdir -p "$(dirname "$LOGFILE")"
+exec >>"$LOGFILE" 2>&1
+
+echo "[$NOW] upssched-cmd START event=$EVENT host=$HOST user=$(id -un) uid=$(id -u)"
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+safe() { # safe "command" "fallback"
+  local cmd="$1" fb="${2:-N/A}"
+  sh -lc "$cmd" 2>/dev/null || echo "$fb"
+}
+
+get_upsc() { # get_upsc VAR
+  local var="$1"
+  upsc "$UPS_NAME" "$var" 2>/dev/null || true
+}
+
+trim() { awk '{$1=$1; print}'; }
+
+fmt_minutes() {
+  local sec="${1:-}"
+  if [[ -z "$sec" ]]; then echo "N/A"; return; fi
+  if [[ "$sec" =~ ^[0-9]+$ ]]; then
+    printf "%d min" "$((sec/60))"
+  else
+    echo "N/A"
+  fi
+}
+
+# =========================
+# COLLECT SYSTEM
+# =========================
+UPTIME="$(safe 'uptime -p' 'N/A')"
+LOAD="$(safe "uptime | awk -F'load average:' '{print \$2}' | xargs" 'N/A')"
+RAM="$(safe "free -h | awk '/Mem:/ {print \$3\" / \"\$2}'" 'N/A')"
+DISK="$(safe "df -h / | awk 'NR==2 {print \$3\" / \"\$2\" (\"\$5\")\"}'" 'N/A')"
+
+# =========================
+# COLLECT UPS
+# =========================
+UPS_STATUS="$(get_upsc ups.status | trim)"
+UPS_BATTERY="$(get_upsc battery.charge | trim)"
+UPS_RUNTIME_SEC="$(get_upsc battery.runtime | trim)"
+UPS_RUNTIME="$(fmt_minutes "$UPS_RUNTIME_SEC")"
+UPS_INPUT="$(get_upsc input.voltage | grep -Eo '^[0-9]+(\.[0-9]+)?' || true)"
+UPS_LOAD="$(get_upsc ups.load | trim)"
+
+# Clean defaults
+[[ -z "${UPS_STATUS}" ]] && UPS_STATUS="indisponible"
+[[ -z "${UPS_BATTERY}" ]] && UPS_BATTERY="N/A"
+[[ -z "${UPS_INPUT}" ]] && UPS_INPUT="N/A"
+[[ -z "${UPS_LOAD}" ]] && UPS_LOAD="N/A"
+[[ -z "${UPS_RUNTIME}" ]] && UPS_RUNTIME="N/A"
+
+echo "[$NOW] UPS status=$UPS_STATUS bat=$UPS_BATTERY runtime=$UPS_RUNTIME load=$UPS_LOAD input=$UPS_INPUT"
+
+# =========================
+# DISCORD (STYLE TABLEAU comme ta capture)
+# =========================
+make_discord_payload() {
+  local emoji="$1" title="$2" desc="$3" color="$4"
+  local timestamp today_hm
+
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  today_hm="$(date '+%H:%M')"
+
+  jq -n \
+    --arg username "$BOT_NAME" \
+    --arg avatar_url "$AVATAR_URL" \
+    --arg content "${DISCORD_MENTION} ${emoji} **[${EVENT}]**" \
+    --arg title "$title" \
+    --arg desc "$desc" \
+    --arg timestamp "$timestamp" \
+    --arg status "$UPS_STATUS" \
+    --arg battery "${UPS_BATTERY} %" \
+    --arg runtime "$UPS_RUNTIME" \
+    --arg input "${UPS_INPUT} V" \
+    --arg load "${UPS_LOAD} %" \
+    --arg host "$HOST" \
+    --arg uptime "$UPTIME" \
+    --arg disk "$DISK" \
+    --arg cpu "$LOAD" \
+    --arg ram "$RAM" \
+    --arg footer_text "Alerte UPS automatique • Aujourd’hui à ${today_hm}" \
+    --argjson color "$color" \
+'{
+  username: $username,
+  avatar_url: $avatar_url,
+  content: $content,
+  embeds: [{
+    title: $title,
+    description: $desc,
+    color: $color,
+    timestamp: $timestamp,
+    footer: { text: $footer_text },
+    fields: [
+      { name: "🧠 État UPS", value: $status, inline: true },
+      { name: "🔋 Batterie", value: $battery, inline: true },
+      { name: "⏳ Autonomie", value: $runtime, inline: true },
+
+      { name: "🔌 Tension Entrée", value: $input, inline: true },
+      { name: "⚡ Charge UPS", value: $load, inline: true },
+      { name: "🖥️ Serveur", value: $host, inline: true },
+
+      { name: "📈 Uptime", value: $uptime, inline: true },
+      { name: "💽 Disque /", value: $disk, inline: true },
+      { name: "🧮 CPU", value: $cpu, inline: true },
+
+      { name: "🧠 RAM", value: $ram, inline: true }
+    ]
+  }]
+}'
+}
+
+send_discord() {
+  local emoji="$1" title="$2" desc="$3" color="$4"
+  if ! need_cmd jq; then
+    echo "[$NOW] WARN jq not found -> skipping discord"
+    return 0
+  fi
+
+  make_discord_payload "$emoji" "$title" "$desc" "$color" \
+    | /etc/nut/upssched/send_discord_trottisteel.sh || true
+
+  make_discord_payload "$emoji" "$title" "$desc" "$color" \
+    | /etc/nut/upssched/send_discord_kitcraft.sh || true
+}
+
+# =========================
+# EMAIL (INCHANGÉ)
+# =========================
+email_template() {
+  local severity="$1" title="$2" body_html="$3"
+
+  local accent bg badge
+  case "$severity" in
+    ok)       accent="#16a34a"; bg="#ecfdf5"; badge="OK" ;;
+    warn)     accent="#f59e0b"; bg="#fffbeb"; badge="ALERTE" ;;
+    critical) accent="#dc2626"; bg="#fef2f2"; badge="CRITIQUE" ;;
+    *)        accent="#2563eb"; bg="#eff6ff"; badge="INFO" ;;
+  esac
+
+  cat <<HTML
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+  <span style="display:none!important;opacity:0;color:transparent;height:0;width:0;overflow:hidden;">
+    ${HOST} • ${EVENT} • ${NOW} • UPS ${UPS_STATUS} ${UPS_BATTERY}%
+  </span>
+
+  <div style="max-width:720px;margin:0 auto;padding:18px;">
+    <div style="background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.08);">
+      <div style="padding:18px;background:${accent};color:#fff;">
+        <div style="font-size:13px;opacity:.95;letter-spacing:.3px;">${MAIL_SUBJECT_PREFIX} • NUT Monitoring</div>
+        <div style="font-size:22px;font-weight:800;margin-top:6px;line-height:1.2;">${title}</div>
+        <div style="margin-top:10px;">
+          <span style="display:inline-block;background:rgba(255,255,255,.2);padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700;">${badge}</span>
+          <span style="display:inline-block;margin-left:10px;font-size:12px;opacity:.95;">${HOST} • ${NOW}</span>
+        </div>
+      </div>
+
+      <div style="padding:18px;">
+        <div style="background:${bg};border:1px solid rgba(0,0,0,.06);border-left:6px solid ${accent};border-radius:12px;padding:14px;">
+          <div style="font-size:15px;line-height:1.55;">${body_html}</div>
+        </div>
+
+        <div style="height:14px;"></div>
+
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;">
+          <div style="font-weight:800;font-size:14px;margin-bottom:10px;">⚡ Infos UPS</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Statut</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${UPS_STATUS}</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Batterie</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${UPS_BATTERY}%</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Autonomie</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${UPS_RUNTIME}</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Charge</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${UPS_LOAD}%</td></tr>
+            <tr><td style="padding:8px 0;">Entrée</td><td style="padding:8px 0;font-weight:700;text-align:right;">${UPS_INPUT}V</td></tr>
+          </table>
+        </div>
+
+        <div style="height:12px;"></div>
+
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;">
+          <div style="font-weight:800;font-size:14px;margin-bottom:10px;">🖥️ Infos serveur</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Serveur</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${HOST}</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">Uptime</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${UPTIME}</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">CPU load</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${LOAD}</td></tr>
+            <tr><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;">RAM</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;font-weight:700;text-align:right;">${RAM}</td></tr>
+            <tr><td style="padding:8px 0;">Disque /</td><td style="padding:8px 0;font-weight:700;text-align:right;">${DISK}</td></tr>
+          </table>
+        </div>
+
+        <div style="margin-top:14px;font-size:12px;color:#6b7280;line-height:1.5;">
+          Événement NUT : <b>${EVENT}</b> • UPS : <b>${UPS_NAME}</b><br/>
+          Ce message est généré automatiquement par <b>upssched-cmd</b>.
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+HTML
+}
+
+send_email() {
+  local severity="$1" title="$2" body_html="$3" body_text="$4"
+
+  local subject="${MAIL_SUBJECT_PREFIX} • ${title} • ${HOST}"
+  local boundary="BOUNDARY_$(date +%s)_$RANDOM"
+
+  local text="${body_text}
+
+---
+Serveur: ${HOST}
+Événement: ${EVENT}
+Heure: ${NOW}
+
+UPS: status=${UPS_STATUS}, battery=${UPS_BATTERY}%, runtime=${UPS_RUNTIME}, load=${UPS_LOAD}%, input=${UPS_INPUT}V
+Système: uptime=${UPTIME}, cpu=${LOAD}, ram=${RAM}, disk=${DISK}
+"
+
+  local html
+  html="$(email_template "$severity" "$title" "$body_html")"
+
+  {
+    echo "Subject: ${subject}"
+    echo "From: ${MAIL_FROM}"
+    echo "To: ${MAIL_TO}"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: multipart/alternative; boundary=${boundary}"
+    echo
+    echo "--${boundary}"
+    echo "Content-Type: text/plain; charset=UTF-8"
+    echo "Content-Transfer-Encoding: 8bit"
+    echo
+    echo "$text"
+    echo
+    echo "--${boundary}"
+    echo "Content-Type: text/html; charset=UTF-8"
+    echo "Content-Transfer-Encoding: 8bit"
+    echo
+    echo "$html"
+    echo
+    echo "--${boundary}--"
+  } | msmtp -t
+}
+
+# =========================
+# EVENT LOGIC
+# =========================
+case "$EVENT" in
+  notify_onbatt)
+    logger "NUT: coupure confirmée (notify_onbatt) — envoi alertes"
+
+    send_discord "⚠️" "Coupure de courant confirmée" \
+      "L'onduleur est sur batterie depuis 5 sec. Si le courant ne revient pas sous 5 min, extinction." \
+      16753920
+
+    send_email "warn" "Coupure confirmée" \
+      "<p style='margin:0 0 8px 0;'>Le serveur <b>${HOST}</b> fonctionne actuellement sur <b>batterie</b>.</p>
+       <p style='margin:0;'>Si le secteur ne revient pas sous <b>5 minutes</b>, une extinction contrôlée pourra être déclenchée pour éviter une coupure brutale.</p>" \
+      "Coupure confirmée : ${HOST} est sur batterie. Si le courant ne revient pas sous 5 minutes, extinction contrôlée possible."
+    ;;
+
+  cancelshutdown|online)
+    logger "NUT: courant rétabli (online/cancelshutdown) — envoi alertes"
+
+    send_discord "✅" "Courant rétabli" \
+      "L'alimentation secteur est de retour. Extinction automatique annulée." \
+      65280
+
+    send_email "ok" "Courant rétabli" \
+      "<p style='margin:0 0 8px 0;'>L'alimentation secteur est de retour sur <b>${HOST}</b>.</p>
+       <p style='margin:0;'>Toute procédure d'extinction automatique est <b>annulée</b>.</p>" \
+      "Courant rétabli : extinction annulée."
+    ;;
+
+  shutdowncritical)
+    logger "NUT: autonomie critique (shutdowncritical) — extinction"
+
+    send_discord "⛔" "Extinction imminente" \
+      "UPS presque vide. Extinction immédiate du serveur." \
+      16711680
+
+    send_email "critical" "Autonomie critique — extinction" \
+      "<p style='margin:0 0 8px 0;'><b>Autonomie UPS critique</b> : le serveur va s'éteindre immédiatement pour éviter une coupure brutale.</p>
+       <p style='margin:0;'>Extinction contrôlée en cours…</p>" \
+      "Autonomie UPS critique : extinction immédiate."
+    /sbin/shutdown -h now
+    ;;
+
+  *)
+    logger "NUT: événement inconnu '$EVENT'"
+    echo "[$NOW] INFO unknown event=$EVENT"
+    ;;
+esac
+
+echo "[$NOW] upssched-cmd END event=$EVENT"
+exit 0

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EMAIL="Adresse email"
+EMAIL="email@domainename.com"
 SUBJECT="$1"
 BODY="$2"
 MSMTP_CONF="/etc/nut/msmtp/msmtprc-nut"

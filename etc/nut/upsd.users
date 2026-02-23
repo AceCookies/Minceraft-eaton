@@ -1,0 +1,10 @@
+cat > /etc/nut/upsd.users <<'EOF'
+[monuser]
+  password = PASSWORD
+  upsmon master
+EOF
+
+chown root:nut /etc/nut/upsd.users
+chmod 640 /etc/nut/upsd.users
+
+cat -n /etc/nut/upsd.users
