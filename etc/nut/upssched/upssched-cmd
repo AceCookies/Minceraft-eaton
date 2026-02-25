@@ -8,7 +8,7 @@ UPS_NAME="eatonups@localhost"
 
 # Email (NE PAS TOUCHER : on garde le rendu actuel)
 MAIL_TO="EMAIL@DOMAINE.com"
-MAIL_FROM="Minceraft <noreply@trottisteel.fr>"
+MAIL_FROM="Minceraft <fromail@domaine.com>"
 MAIL_SUBJECT_PREFIX="UPS"
 
 # Discord (style "tableau" + ping)
